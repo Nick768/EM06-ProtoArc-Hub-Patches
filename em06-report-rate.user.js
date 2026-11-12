@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ProtoArc HUB – EM06 Polling Rate Unlock
 // @namespace    https://github.com/Nick768/EM06-ProtoArc-Hub-Patches
-// @version      1.2.0
+// @version      1.2.1
 // @description  Shows the polling-rate selector (125/250/500/1000 Hz) for the ProtoArc EM06 in the official ProtoArc HUB and offers the (CSS-only) dark theme in the settings. Works by patching the app bundle in memory before it executes; nothing is uploaded, no data is sent anywhere.
 // @author       Nick768
 // @match        https://hub.protoarc.com/*
@@ -353,6 +353,8 @@
   async function hijack(el) {
     const url = el.getAttribute('src');
     el.remove(); // cancels execution only if the parser has not committed to the fetch yet
+    // ask *before* our own fetch: that one adds a resource-timing entry too
+    const queued = wasFetched(url);
 
     let original;
     try {
@@ -391,7 +393,34 @@
     patchedCode = result.code;
     bundleUrl = url;
     markerOk = r.applied.some((x) => x.indexOf('mount-marker') === 0);
+
+    // If a resource-timing entry for the bundle already exists, the browser had
+    // started fetching it before we removed the element, so that copy will run
+    // too. Let it mount first and take the container over afterwards: one swap
+    // instead of mount → takeover → mount again.
+    if (queued) {
+      console.info(LOG, 'the bundle was already loading when the userscript started – letting it boot first, then taking over');
+      await waitFor(() => {
+        const h = appHost();
+        return !!(h && h.__vue_app__);
+      }, 12000);
+    }
+
     await bootPatched(result.code, url, '');
+  }
+
+  function wasFetched(url) {
+    try {
+      const abs = new URL(url, location.href).href;
+      const list = performance.getEntriesByType('resource');
+      for (let i = 0; i < list.length; i++) {
+        // only the parser's own <script> load counts – a `fetch` entry would be ours
+        if (list[i].name === abs && list[i].initiatorType === 'script') return true;
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    return false;
   }
 
   /* -----------------------------------------------------------------------
@@ -493,7 +522,16 @@
           return;
         }
         reasserts++;
-        console.warn(LOG, 'the HUB\'s queued bundle mounted over the patched app – mounting the patch again (' + reasserts + '/' + MAX_REASSERTS + ')');
+        // info, not warn: this is the documented fallback path, and a warning
+        // would dump a useless stack trace into the console
+        console.info(
+          LOG,
+          'the HUB\'s queued bundle mounted over the patched app – mounting the patch again (' +
+            reasserts +
+            '/' +
+            MAX_REASSERTS +
+            ', expected when the userscript starts late)'
+        );
         bootPatched(patchedCode, bundleUrl, 're-assert ' + reasserts).catch((e) => console.error(LOG, 're-assert failed', e));
         return;
       }
@@ -524,6 +562,25 @@
       'a duplicate HUB app was replaced (the queued bundle booted too) – the locale loop it left behind is harmless'
     );
   });
+
+  /* Small live status hook: readable in DevTools and used by the tests to wait
+   * for the *settled* state instead of guessing via the DOM. */
+  try {
+    Object.defineProperty(window, '__em06Rate', {
+      configurable: true,
+      get() {
+        return {
+          boots: boots,
+          reasserts: reasserts,
+          mounted: appRoot() === ourRoot && ourRoot !== null,
+          active: patchedActive && appRoot() === ourRoot && ourRoot !== null,
+          version: '1.2.1',
+        };
+      },
+    });
+  } catch (e) {
+    /* ignore */
+  }
 
   let started = false;
   function scan() {
