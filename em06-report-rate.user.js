@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ProtoArc HUB – EM06 Polling Rate Unlock
 // @namespace    https://github.com/Nick768/EM06-ProtoArc-Hub-Patches
-// @version      1.1.1
+// @version      1.2.0
 // @description  Shows the polling-rate selector (125/250/500/1000 Hz) for the ProtoArc EM06 in the official ProtoArc HUB and offers the (CSS-only) dark theme in the settings. Works by patching the app bundle in memory before it executes; nothing is uploaded, no data is sent anywhere.
 // @author       Nick768
 // @match        https://hub.protoarc.com/*
@@ -235,6 +235,32 @@
       }
     }
 
+    // 5) boot marker: tag the container with the boot number. The boot code
+    //    needs it to tell "our patched app is the mounted one" apart from "a
+    //    queued, unpatched copy of the bundle mounted over ours". A queued
+    //    module cannot be cancelled any more, so that race is unavoidable –
+    //    detecting it and mounting the patched app again is what makes the
+    //    result deterministic.
+    if (out.indexOf('data-em06-owner') !== -1) {
+      report.applied.push('mount-marker(pre-existing)');
+    } else {
+      const mountRe = /\b([A-Za-z_$][\w$]*)\.mount\(\s*(["'])#app\2\s*\)/;
+      const mm = mountRe.exec(out);
+      if (mm) {
+        const repl =
+          '((window.__em06Mount=(window.__em06Mount||0)+1),' +
+          'document.getElementById("app").setAttribute("data-em06-owner",String(window.__em06Mount)),' +
+          mm[1] +
+          '.mount("#app"))';
+        out = out.slice(0, mm.index) + repl + out.slice(mm.index + mm[0].length);
+        report.applied.push('mount-marker');
+      } else {
+        report.warnings.push(
+          'app.mount("#app") not found – boot marker missing (duplicate-boot detection degraded)'
+        );
+      }
+    }
+
     report.ok = report.applied.some((x) => x.indexOf('rate-panel-visibility') === 0);
     if (!report.ok) report.warnings.push('patch incomplete – injecting bundle unpatched');
     return { code: out, report };
@@ -326,7 +352,7 @@
 
   async function hijack(el) {
     const url = el.getAttribute('src');
-    el.remove(); // cancel execution of the unpatched bundle
+    el.remove(); // cancels execution only if the parser has not committed to the fetch yet
 
     let original;
     try {
@@ -360,29 +386,132 @@
       r.warnings.length ? '| warnings: ' + r.warnings.join(' ; ') : ''
     );
 
-    const ok = await injectPatched(result.code, url);
-    if (!ok) {
-      console.warn(LOG, 'patch not active – HUB runs unpatched');
-      return;
+    // `patch OK` only says the bundle was rewritten. Whether the patched app is
+    // the one that ends up in #app is a separate question – see bootPatched().
+    patchedCode = result.code;
+    bundleUrl = url;
+    markerOk = r.applied.some((x) => x.indexOf('mount-marker') === 0);
+    await bootPatched(result.code, url, '');
+  }
+
+  /* -----------------------------------------------------------------------
+   * Only one app may survive in #app, and it has to be the patched one.
+   *
+   * A userscript manager can start after the parser already queued the bundle,
+   * and a queued module cannot be cancelled any more by removing its element.
+   * That copy then boots too – sometimes before ours (it comes from the HTTP
+   * cache), sometimes after. Two apps in one container is a coin toss, so the
+   * mount is made deterministic: the patched bundle tags #app with its boot
+   * number, and if anything else takes the container over afterwards, the
+   * patched app is mounted again (bounded, at most MAX_REASSERTS times).
+   * ----------------------------------------------------------------------- */
+  let patchedActive = false; // patch injected and running
+  let unmountedOnce = false; // we deliberately unmounted an app
+  let booting = false;
+  let boots = 0; // patched boots started
+  let ourRoot = null; // root node created by the last patched boot
+  let reasserts = 0;
+  let patchedCode = null;
+  let bundleUrl = null;
+  let markerOk = false;
+  const MAX_REASSERTS = 2;
+
+  function appHost() {
+    return document.getElementById('app');
+  }
+  function appRoot() {
+    const h = appHost();
+    return h ? h.firstElementChild : null;
+  }
+  function ownerMark() {
+    const h = appHost();
+    return h ? parseInt(h.getAttribute('data-em06-owner') || '0', 10) || 0 : 0;
+  }
+
+  // A replaced app is not unmounted by Vue – its listeners, timers and HID
+  // handles stay alive without any DOM. Tear it down properly. The short grace
+  // period lets the HUB's own language loop (7 lang files, started in setup)
+  // finish instead of being cut off mid-flight.
+  function unmountCurrent() {
+    const h = appHost();
+    const app = h && h.__vue_app__;
+    if (!app || typeof app.unmount !== 'function') return Promise.resolve();
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        unmountedOnce = true;
+        try {
+          app.unmount();
+        } catch (e) {
+          /* ignore */
+        }
+        resolve();
+      }, 300);
+    });
+  }
+
+  async function bootPatched(code, url, note) {
+    if (booting || !code) return false;
+    booting = true;
+    try {
+      await unmountCurrent();
+      const before = appRoot();
+      const expected = boots + 1;
+      const ok = await injectPatched(code, url);
+      if (!ok) return false;
+      boots = expected;
+      patchedActive = true;
+      // the bundle mounts only after its JSON fetches; wait for that mount and
+      // make sure it is ours (marker) – degrade to "a new root appeared" when
+      // the marker patch could not be applied to this bundle build.
+      const mounted = await waitFor(() => {
+        const root = appRoot();
+        if (!root) return false;
+        return markerOk ? ownerMark() === expected : root !== before;
+      }, 15000);
+      ourRoot = mounted ? appRoot() : null;
+      console.info(
+        LOG,
+        (note ? note + ' | ' : '') + 'patched app ' + (mounted ? 'mounted' : 'NOT mounted (timeout)') + ' – ' +
+          (mounted ? 'patches are active' : 'rate panel will be missing; reload with Ctrl+Shift+R')
+      );
+      if (mounted) startWatch();
+      return mounted;
+    } finally {
+      booting = false;
     }
-    patchedActive = true;
+  }
+
+  function startWatch() {
+    const seen = ourRoot;
+    const t0 = Date.now();
+    (function poll() {
+      if (booting) return void setTimeout(poll, 100);
+      if (Date.now() - t0 > 20000) return;
+      if (appRoot() !== seen) {
+        if (reasserts >= MAX_REASSERTS) {
+          console.error(LOG, 'patch lost – the HUB replaced the patched app ' + MAX_REASSERTS + 'x; reload with Ctrl+Shift+R');
+          return;
+        }
+        reasserts++;
+        console.warn(LOG, 'the HUB\'s queued bundle mounted over the patched app – mounting the patch again (' + reasserts + '/' + MAX_REASSERTS + ')');
+        bootPatched(patchedCode, bundleUrl, 're-assert ' + reasserts).catch((e) => console.error(LOG, 're-assert failed', e));
+        return;
+      }
+      setTimeout(poll, 100);
+    })();
   }
 
   /* -------------------------------------------------------------------------
-   * A userscript manager may start a few milliseconds after the parser has
-   * already queued the app bundle, and a queued module script cannot be
-   * cancelled by removing its element any more. The unpatched copy then boots
-   * as well and is immediately replaced by the patched app. The vue-i18n
-   * mixin deletes `this.$i18n` on unmount, so the language loop of the
-   * replaced app dies with
+   * vue-i18n's mixin deletes `this.$i18n` on unmount, so an app that is
+   * replaced or unmounted while its language loop is still running ends in
    *   TypeError: Cannot read properties of undefined (reading 'setLocaleMessage')
-   * The patched app is not affected (it registers all locales), so this single
-   * rejection is swallowed – and reported once, instead of looking like a
-   * broken patch. Any other rejection stays visible.
+   * That loop only registers locale messages – losing it costs nothing, because
+   * the app that survives registers all 7 languages itself. Suppress exactly
+   * that one rejection, and only once we have actually touched the app, so a
+   * genuine error on an unpatched HUB stays visible.
    */
-  let patchedActive = false;
   window.addEventListener('unhandledrejection', function (ev) {
-    if (!patchedActive) return; // unpatched HUB: keep the original error visible
+    if (!patchedActive && !unmountedOnce) return;
     const reason = ev.reason;
     if (!reason || reason.name !== 'TypeError' || String(reason.message).indexOf('setLocaleMessage') === -1) return;
     try {
@@ -392,7 +521,7 @@
     }
     console.info(
       LOG,
-      'the original bundle booted too (userscript started after it was queued) – that duplicate app was replaced by the patched one; the HUB i18n race it leaves behind is harmless'
+      'a duplicate HUB app was replaced (the queued bundle booted too) – the locale loop it left behind is harmless'
     );
   });
 
