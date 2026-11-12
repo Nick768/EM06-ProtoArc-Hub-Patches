@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ProtoArc HUB – EM06 Polling Rate Unlock
 // @namespace    https://github.com/Nick768/EM06-ProtoArc-Hub-Patches
-// @version      1.1.0
+// @version      1.1.1
 // @description  Shows the polling-rate selector (125/250/500/1000 Hz) for the ProtoArc EM06 in the official ProtoArc HUB and offers the (CSS-only) dark theme in the settings. Works by patching the app bundle in memory before it executes; nothing is uploaded, no data is sent anywhere.
 // @author       Nick768
 // @match        https://hub.protoarc.com/*
@@ -361,8 +361,40 @@
     );
 
     const ok = await injectPatched(result.code, url);
-    if (!ok) console.warn(LOG, 'patch not active – HUB runs unpatched');
+    if (!ok) {
+      console.warn(LOG, 'patch not active – HUB runs unpatched');
+      return;
+    }
+    patchedActive = true;
   }
+
+  /* -------------------------------------------------------------------------
+   * A userscript manager may start a few milliseconds after the parser has
+   * already queued the app bundle, and a queued module script cannot be
+   * cancelled by removing its element any more. The unpatched copy then boots
+   * as well and is immediately replaced by the patched app. The vue-i18n
+   * mixin deletes `this.$i18n` on unmount, so the language loop of the
+   * replaced app dies with
+   *   TypeError: Cannot read properties of undefined (reading 'setLocaleMessage')
+   * The patched app is not affected (it registers all locales), so this single
+   * rejection is swallowed – and reported once, instead of looking like a
+   * broken patch. Any other rejection stays visible.
+   */
+  let patchedActive = false;
+  window.addEventListener('unhandledrejection', function (ev) {
+    if (!patchedActive) return; // unpatched HUB: keep the original error visible
+    const reason = ev.reason;
+    if (!reason || reason.name !== 'TypeError' || String(reason.message).indexOf('setLocaleMessage') === -1) return;
+    try {
+      ev.preventDefault();
+    } catch (e) {
+      /* ignore */
+    }
+    console.info(
+      LOG,
+      'the original bundle booted too (userscript started after it was queued) – that duplicate app was replaced by the patched one; the HUB i18n race it leaves behind is harmless'
+    );
+  });
 
   let started = false;
   function scan() {
